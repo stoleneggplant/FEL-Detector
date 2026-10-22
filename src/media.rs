@@ -37,6 +37,7 @@ pub struct VideoStream {
     /// Absolute stream index in the container
     pub index: u64,
     pub codec: String,
+    pub frame_rate: Option<f64>,
     pub dovi: Option<DoviConfig>,
 }
 
@@ -63,6 +64,13 @@ fn as_u64(v: &Value) -> Option<u64> {
 
 fn as_flag(v: &Value) -> bool {
     as_u64(v).unwrap_or(0) != 0
+}
+
+/// Parses ffprobe rationals such as `24000/1001`
+fn parse_rate(v: &Value) -> Option<f64> {
+    let (num, den) = v.as_str()?.split_once('/')?;
+    let rate = num.parse::<f64>().ok()? / den.parse::<f64>().ok()?;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
 }
 
 fn parse_dovi_side_data(side_data: &Value) -> Option<DoviConfig> {
@@ -102,6 +110,8 @@ pub fn parse_ffprobe_json(json: &str) -> Result<ProbeInfo> {
                     Some(VideoStream {
                         index: as_u64(&s["index"])?,
                         codec: s["codec_name"].as_str().unwrap_or("unknown").to_owned(),
+                        frame_rate: parse_rate(&s["avg_frame_rate"])
+                            .or_else(|| parse_rate(&s["r_frame_rate"])),
                         dovi: parse_dovi_side_data(&s["side_data_list"]),
                     })
                 })
@@ -140,14 +150,13 @@ pub fn ffprobe(tools: &Tools, path: &Path) -> Result<ProbeInfo> {
 }
 
 /// Streams `reader` through the NAL splitter into `stats`.
-/// Stops after `max_rpus` new RPUs, `max_bytes` bytes, or as soon as FEL is
-/// detected when `stop_on_fel` is set. Returns `true` if stopped early.
+/// Stops after `max_rpus` new RPUs or `max_bytes` bytes.
+/// Returns `true` if stopped early.
 fn feed_stats(
     reader: &mut impl Read,
     stats: &mut RpuStats,
     max_rpus: u64,
     max_bytes: u64,
-    stop_on_fel: bool,
 ) -> Result<bool> {
     let rpus_before = stats.rpus + stats.parse_errors;
     let mut splitter = NalSplitter::new();
@@ -156,8 +165,7 @@ fn feed_stats(
 
     let mut on_nal = |nal: &[u8]| {
         stats.handle_nal(nal);
-        let enough = stats.rpus + stats.parse_errors - rpus_before >= max_rpus;
-        !(enough || (stop_on_fel && stats.has_fel()))
+        stats.rpus + stats.parse_errors - rpus_before < max_rpus
     };
 
     loop {
@@ -189,8 +197,8 @@ pub struct SampleOptions {
     pub samples: u32,
     /// RPUs (frames) read per position
     pub frames: u32,
-    /// Keep sampling after FEL has been found
-    pub full: bool,
+    /// Skip the remaining sample positions once FEL has been found
+    pub fast: bool,
 }
 
 /// Evenly spread sample positions as fractions of the file, e.g. 3 => 0, 0.33, 0.67.
@@ -239,7 +247,7 @@ pub fn sample_with_ffmpeg(
             .with_context(|| format!("Failed to run {}", tools.ffmpeg.display()))?;
 
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let result = feed_stats(&mut stdout, stats, opts.frames as u64, u64::MAX, !opts.full);
+        let result = feed_stats(&mut stdout, stats, opts.frames as u64, u64::MAX);
         drop(stdout);
 
         let stopped_early = matches!(result, Ok(true));
@@ -255,7 +263,7 @@ pub fn sample_with_ffmpeg(
             bail!("ffmpeg failed: {}", stderr.trim());
         }
 
-        if !opts.full && stats.has_fel() {
+        if opts.fast && stats.has_fel() {
             break;
         }
     }
@@ -270,15 +278,9 @@ pub fn sample_raw_hevc(path: &Path, opts: SampleOptions, stats: &mut RpuStats) -
 
     for fraction in sample_fractions(opts.samples) {
         file.seek(SeekFrom::Start((len as f64 * fraction) as u64))?;
-        feed_stats(
-            &mut file,
-            stats,
-            opts.frames as u64,
-            RAW_SAMPLE_MAX_BYTES,
-            !opts.full,
-        )?;
+        feed_stats(&mut file, stats, opts.frames as u64, RAW_SAMPLE_MAX_BYTES)?;
 
-        if !opts.full && stats.has_fel() {
+        if opts.fast && stats.has_fel() {
             break;
         }
     }
@@ -306,7 +308,7 @@ mod tests {
             "streams": [
                 {
                     "index": 0, "codec_name": "hevc", "codec_type": "video",
-                    "width": 3840, "height": 2160,
+                    "width": 3840, "height": 2160, "avg_frame_rate": "24000/1001",
                     "disposition": { "attached_pic": 0 },
                     "side_data_list": [{
                         "side_data_type": "DOVI configuration record",
@@ -329,6 +331,7 @@ mod tests {
         assert_eq!(info.duration, Some(7200.5));
         assert_eq!(info.video_streams.len(), 1);
         assert_eq!(info.hevc_streams().count(), 1);
+        assert!((info.video_streams[0].frame_rate.unwrap() - 23.976).abs() < 0.001);
         assert_eq!(
             info.dovi(),
             Some(DoviConfig {
@@ -350,6 +353,7 @@ mod tests {
         assert_eq!(info.duration, None);
         assert_eq!(info.dovi(), None);
         assert_eq!(info.hevc_streams().count(), 0);
+        assert_eq!(info.video_streams[0].frame_rate, None);
     }
 
     #[test]

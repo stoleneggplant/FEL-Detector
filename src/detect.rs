@@ -49,6 +49,8 @@ pub struct Report {
     pub profile: Option<u8>,
     /// Base layer signal compatibility ID (e.g. 1 for profile 8.1)
     pub bl_compat_id: Option<u8>,
+    /// Estimated enhancement layer bitrate, from the sampled frames
+    pub el_bitrate_kbps: Option<f64>,
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpu_stats: Option<RpuStats>,
@@ -57,6 +59,15 @@ pub struct Report {
 impl Report {
     pub fn is_fel(&self) -> bool {
         self.status == Status::Fel
+    }
+
+    /// Human readable EL bitrate, e.g. `12.4 Mb/s`
+    pub fn el_bitrate_label(&self) -> String {
+        match self.el_bitrate_kbps {
+            None => String::new(),
+            Some(kbps) if kbps >= 1000.0 => format!("{:.1} Mb/s", kbps / 1000.0),
+            Some(kbps) => format!("{kbps:.0} kb/s"),
+        }
     }
 
     /// Human readable profile, e.g. `P7` or `P8.1`
@@ -92,6 +103,7 @@ pub fn detect(path: &Path, opts: &DetectOptions) -> Report {
             status: Status::Error,
             profile: None,
             bl_compat_id: None,
+            el_bitrate_kbps: None,
             detail: format!("{e:#}"),
             rpu_stats: None,
         },
@@ -107,7 +119,13 @@ fn try_detect(path: &Path, opts: &DetectOptions) -> anyhow::Result<Report> {
     if is_raw_hevc(path) {
         let mut stats = RpuStats::default();
         media::sample_raw_hevc(path, opts.sample, &mut stats)?;
-        return Ok(verdict(path, stats, None));
+
+        // Raw bitstreams have no container timing, ffprobe reads the VUI frame rate
+        let fps = media::ffprobe(&opts.tools, path)
+            .ok()
+            .and_then(|info| info.hevc_streams().find_map(|s| s.frame_rate));
+        let el_bitrate = fps.and_then(|fps| stats.el_bitrate(fps, false));
+        return Ok(verdict(path, stats, None, el_bitrate));
     }
 
     let info = media::ffprobe(&opts.tools, path)?;
@@ -121,6 +139,7 @@ fn detect_container(path: &Path, info: &ProbeInfo, opts: &DetectOptions) -> anyh
         status,
         profile: dovi.map(|c| c.profile),
         bl_compat_id: dovi.map(|c| c.bl_compat_id),
+        el_bitrate_kbps: None,
         detail,
         rpu_stats: None,
     };
@@ -157,9 +176,12 @@ fn detect_container(path: &Path, info: &ProbeInfo, opts: &DetectOptions) -> anyh
     // are carried in the (second) enhancement layer stream.
     let mut candidates: Vec<_> = info.hevc_streams().collect();
     candidates.sort_by_key(|s| s.dovi.is_none());
+    let multiple_hevc_streams = candidates.len() > 1;
 
     let mut stats = RpuStats::default();
+    let mut el_bitrate = None;
     for stream in candidates {
+        stats = RpuStats::default();
         media::sample_with_ffmpeg(
             &opts.tools,
             path,
@@ -170,14 +192,26 @@ fn detect_container(path: &Path, info: &ProbeInfo, opts: &DetectOptions) -> anyh
         )?;
 
         if stats.rpus > 0 {
+            // Dual layer RPUs without wrapped EL NAL units next to another HEVC
+            // stream: this stream is the enhancement layer itself (dual PID)
+            let el_only_stream =
+                multiple_hevc_streams && stats.el_nalus == 0 && stats.has_dual_layer_rpus();
+            el_bitrate = stream
+                .frame_rate
+                .and_then(|fps| stats.el_bitrate(fps, el_only_stream));
             break;
         }
     }
 
-    Ok(verdict(path, stats, dovi))
+    Ok(verdict(path, stats, dovi, el_bitrate))
 }
 
-fn verdict(path: &Path, stats: RpuStats, dovi: Option<DoviConfig>) -> Report {
+fn verdict(
+    path: &Path,
+    stats: RpuStats,
+    dovi: Option<DoviConfig>,
+    el_bitrate: Option<f64>,
+) -> Report {
     let sampled = stats.rpus;
     let (status, detail) = if stats.fel_rpus > 0 {
         (
@@ -219,6 +253,7 @@ fn verdict(path: &Path, stats: RpuStats, dovi: Option<DoviConfig>) -> Report {
         status,
         profile,
         bl_compat_id,
+        el_bitrate_kbps: el_bitrate.map(|bps| (bps / 100.0).round() / 10.0),
         detail,
         rpu_stats: Some(stats),
     }
@@ -240,14 +275,17 @@ mod tests {
     #[test]
     fn verdicts() {
         let p = Path::new("x.mkv");
-        assert_eq!(verdict(p, stats_with(true, 2), None).status, Status::Fel);
+        assert_eq!(
+            verdict(p, stats_with(true, 2), None, None).status,
+            Status::Fel
+        );
 
-        let mel = verdict(p, stats_with(false, 2), None);
+        let mel = verdict(p, stats_with(false, 2), None, None);
         assert_eq!(mel.status, Status::Mel);
         assert_eq!(mel.profile_label(), "P7");
 
         assert_eq!(
-            verdict(p, RpuStats::default(), None).status,
+            verdict(p, RpuStats::default(), None, None).status,
             Status::NoDolbyVision
         );
 
@@ -260,7 +298,7 @@ mod tests {
             bl_compat_id: 6,
         };
         assert_eq!(
-            verdict(p, RpuStats::default(), Some(dovi)).status,
+            verdict(p, RpuStats::default(), Some(dovi), None).status,
             Status::Unknown
         );
     }
@@ -269,7 +307,7 @@ mod tests {
     fn mixed_samples_are_fel() {
         let mut stats = stats_with(false, 5);
         stats.handle_nal(&profile7_rpu_nalu(true));
-        let report = verdict(Path::new("x.mkv"), stats, None);
+        let report = verdict(Path::new("x.mkv"), stats, None, None);
         assert!(report.is_fel());
         assert!(report.detail.contains("1/6"));
     }
