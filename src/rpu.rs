@@ -23,14 +23,33 @@ pub struct RpuStats {
     pub el_nalus: u64,
     /// Dolby Vision profiles as derived from the RPU headers
     pub profiles: BTreeMap<u8, u64>,
+    /// Pictures (first slice segments of unwrapped VCL NAL units)
+    pub frames: u64,
+    /// Bytes of all NAL units
+    pub total_bytes: u64,
+    /// Bytes of UNSPEC63 (wrapped enhancement layer) NAL units
+    pub el_bytes: u64,
+    /// Bytes of RPU NAL units
+    pub rpu_bytes: u64,
 }
 
 impl RpuStats {
     /// Processes one HEVC NAL unit (including its 2 byte header).
     pub fn handle_nal(&mut self, nal: &[u8]) {
+        let len = nal.len() as u64;
+        self.total_bytes += len;
+
         match hevc_nal_type(nal) {
-            Some(NAL_UNSPEC62_RPU) => self.handle_rpu(nal),
-            Some(NAL_UNSPEC63_EL) => self.el_nalus += 1,
+            Some(NAL_UNSPEC62_RPU) => {
+                self.rpu_bytes += len;
+                self.handle_rpu(nal);
+            }
+            Some(NAL_UNSPEC63_EL) => {
+                self.el_nalus += 1;
+                self.el_bytes += len;
+            }
+            // VCL NAL unit with first_slice_segment_in_pic_flag set
+            Some(0..32) if nal.get(2).is_some_and(|b| b & 0x80 != 0) => self.frames += 1,
             _ => {}
         }
     }
@@ -64,6 +83,32 @@ impl RpuStats {
 
     pub fn has_fel(&self) -> bool {
         self.fel_rpus > 0
+    }
+
+    /// RPUs carrying an enhancement layer description (profiles 4 and 7)
+    pub fn has_dual_layer_rpus(&self) -> bool {
+        self.fel_rpus + self.mel_rpus > 0
+    }
+
+    /// Estimated enhancement layer bitrate in bits per second.
+    ///
+    /// For single track dual layer streams the EL is the UNSPEC63 NAL units.
+    /// With `el_only_stream` (separate EL stream, e.g. Blu-ray dual PID) every
+    /// NAL unit except the RPUs belongs to the EL.
+    pub fn el_bitrate(&self, fps: f64, el_only_stream: bool) -> Option<f64> {
+        if self.frames == 0 || !(fps.is_finite() && fps > 0.0) {
+            return None;
+        }
+
+        let bytes = if self.el_nalus > 0 {
+            self.el_bytes
+        } else if el_only_stream {
+            self.total_bytes - self.rpu_bytes
+        } else {
+            return None;
+        };
+
+        Some(bytes as f64 * 8.0 * fps / self.frames as f64)
     }
 }
 
@@ -135,6 +180,27 @@ pub(crate) mod tests {
         assert_eq!(stats.rpus, 1);
         assert_eq!(stats.fel_rpus + stats.mel_rpus, 0);
         assert_eq!(stats.dominant_profile(), Some(8));
+    }
+
+    #[test]
+    fn el_bitrate() {
+        let mut stats = RpuStats::default();
+        for _ in 0..24 {
+            stats.handle_nal(&[0x26, 0x01, 0x80, 0x00]); // IDR, first slice
+            stats.handle_nal(&[0x02, 0x01, 0x00, 0x00]); // trailing slice, not first
+            stats.handle_nal(&[0x7E, 0x01, 0x00, 0x00, 0x00, 0x00]); // 6 bytes EL
+        }
+
+        assert_eq!(stats.frames, 24);
+        assert_eq!(stats.el_bytes, 24 * 6);
+        // 6 bytes per frame at 24 fps
+        assert_eq!(stats.el_bitrate(24.0, false), Some(6.0 * 8.0 * 24.0));
+        assert_eq!(stats.el_bitrate(0.0, false), None);
+
+        let mut el_stream = RpuStats::default();
+        el_stream.handle_nal(&[0x26, 0x01, 0x80, 0x00]);
+        assert_eq!(el_stream.el_bitrate(1.0, false), None);
+        assert_eq!(el_stream.el_bitrate(1.0, true), Some(32.0));
     }
 
     #[test]

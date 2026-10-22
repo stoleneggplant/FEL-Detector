@@ -58,13 +58,13 @@ fn ffmpeg(args: &[&str]) {
     assert!(status.success(), "ffmpeg {args:?} failed");
 }
 
-fn encode_base(dir: &Path) -> Vec<u8> {
-    let out = dir.join("base.hevc");
+fn encode(dir: &Path, name: &str, size: &str) -> Vec<u8> {
+    let out = dir.join(format!("{name}.hevc"));
     ffmpeg(&[
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=320x180:rate=24",
+        &format!("testsrc2=size={size}:rate=24"),
         "-frames:v",
         &FRAMES.to_string(),
         "-pix_fmt",
@@ -80,12 +80,10 @@ fn encode_base(dir: &Path) -> Vec<u8> {
     std::fs::read(out).unwrap()
 }
 
-/// Appends an RPU after every VCL NAL unit (single slice per frame).
-/// `rpu_for_frame` chooses the RPU type per frame, `None` skips it.
-fn inject_rpus(base: &[u8], rpu_for_frame: impl Fn(usize) -> Option<Rpu>) -> Vec<u8> {
+fn split_nals(stream: &[u8]) -> Vec<Vec<u8>> {
     let mut nals = Vec::new();
     let mut splitter = NalSplitter::new();
-    splitter.push(base, |n| {
+    splitter.push(stream, |n| {
         nals.push(n.to_vec());
         true
     });
@@ -93,6 +91,60 @@ fn inject_rpus(base: &[u8], rpu_for_frame: impl Fn(usize) -> Option<Rpu>) -> Vec
         nals.push(n.to_vec());
         true
     });
+    nals
+}
+
+fn is_vcl(nal: &[u8]) -> bool {
+    hevc_nal_type(nal).unwrap() < 32
+}
+
+/// Groups NAL units per frame: everything up to and including the (single) slice.
+fn split_frames(stream: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    let mut frames = vec![Vec::new()];
+    for nal in split_nals(stream) {
+        let vcl = is_vcl(&nal);
+        frames.last_mut().unwrap().push(nal);
+        if vcl {
+            frames.push(Vec::new());
+        }
+    }
+    frames.pop();
+    assert_eq!(frames.len(), FRAMES);
+    frames
+}
+
+fn put_nal(out: &mut Vec<u8>, nal: &[u8]) {
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend_from_slice(nal);
+}
+
+/// Single track dual layer stream: every BL frame is followed by its EL NAL
+/// units wrapped in UNSPEC63 and a FEL RPU.
+/// Returns the stream and the size of all UNSPEC63 NAL units.
+fn wrap_el(base: &[u8], el: &[u8]) -> (Vec<u8>, u64) {
+    let mut out = Vec::new();
+    let mut el_bytes = 0;
+    for (bl_frame, el_frame) in split_frames(base).iter().zip(split_frames(el)) {
+        bl_frame.iter().for_each(|nal| put_nal(&mut out, nal));
+        for nal in el_frame {
+            let wrapped = [&[0x7E, 0x01], nal.as_slice()].concat();
+            el_bytes += wrapped.len() as u64;
+            put_nal(&mut out, &wrapped);
+        }
+        put_nal(&mut out, &rpu_nalu(Rpu::Fel));
+    }
+    (out, el_bytes)
+}
+
+/// Bitrate in kb/s of `bytes` spread over the whole clip at 24 fps
+fn kbps(bytes: u64) -> f64 {
+    bytes as f64 * 8.0 * 24.0 / FRAMES as f64 / 1000.0
+}
+
+/// Appends an RPU after every VCL NAL unit (single slice per frame).
+/// `rpu_for_frame` chooses the RPU type per frame, `None` skips it.
+fn inject_rpus(base: &[u8], rpu_for_frame: impl Fn(usize) -> Option<Rpu>) -> Vec<u8> {
+    let nals = split_nals(base);
 
     let mut out = Vec::new();
     let mut frame = 0;
@@ -159,18 +211,32 @@ fn status_of<'a>(reports: &'a [Value], file: &str) -> &'a str {
         .unwrap()
 }
 
-fn setup() -> Option<PathBuf> {
+fn el_bitrate_of(reports: &[Value], file: &str) -> Option<f64> {
+    reports
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with(file))
+        .unwrap_or_else(|| panic!("{file} not in report"))["el_bitrate_kbps"]
+        .as_f64()
+}
+
+/// Creates an empty test directory with a `media` subdirectory
+fn test_dir(name: &str) -> Option<PathBuf> {
     if !ffmpeg_with_x265() {
         eprintln!("skipping: ffmpeg with libx265 not available");
         return None;
     }
 
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e");
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("media")).unwrap();
+    Some(dir)
+}
+
+fn setup() -> Option<PathBuf> {
+    let dir = test_dir("e2e")?;
     let media = dir.join("media");
 
-    let base = encode_base(&dir);
+    let base = encode(&dir, "base", "320x180");
     let both = &["mkv", "ts"];
     write_variants(&media, "fel", &inject_rpus(&base, |_| Some(Rpu::Fel)), both);
     write_variants(&media, "mel", &inject_rpus(&base, |_| Some(Rpu::Mel)), both);
@@ -225,4 +291,90 @@ fn detects_fel_files_in_directory() {
     // A single sample position only sees the MEL part of late_fel
     let reports = run_detector(&["--samples", "1", &format!("{media}/late_fel.ts")]);
     assert_eq!(status_of(&reports, "late_fel.ts"), "MEL");
+}
+
+#[test]
+fn measures_el_bitrate() {
+    let Some(dir) = test_dir("e2e_el") else {
+        return;
+    };
+    let media = dir.join("media");
+
+    let base = encode(&dir, "base", "320x180");
+    let el = encode(&dir, "el", "160x90");
+
+    // Single track dual layer: EL wrapped in UNSPEC63 NAL units
+    let (single, el_bytes) = wrap_el(&base, &el);
+    write_variants(&media, "single", &single, &["mkv", "ts"]);
+    let expected_single = kbps(el_bytes);
+
+    // Blu-ray style dual PID: separate EL stream carrying the RPUs
+    let mut el_stream = Vec::new();
+    let mut el_stream_bytes = 0;
+    for frame in split_frames(&el) {
+        for nal in frame {
+            el_stream_bytes += nal.len() as u64;
+            put_nal(&mut el_stream, &nal);
+        }
+        put_nal(&mut el_stream, &rpu_nalu(Rpu::Fel));
+    }
+    let el_path = dir.join("el_rpu.hevc");
+    std::fs::write(&el_path, &el_stream).unwrap();
+    let base_path = dir.join("base.hevc");
+    let dual = media.join("dual.ts");
+    ffmpeg(&[
+        "-f",
+        "hevc",
+        "-r",
+        "24",
+        "-i",
+        base_path.to_str().unwrap(),
+        "-f",
+        "hevc",
+        "-r",
+        "24",
+        "-i",
+        el_path.to_str().unwrap(),
+        "-map",
+        "0",
+        "-map",
+        "1",
+        "-c",
+        "copy",
+        dual.to_str().unwrap(),
+    ]);
+    let expected_dual = kbps(el_stream_bytes);
+
+    // A file without EL next to them, filtered out by --fel-only
+    write_variants(
+        &media,
+        "mel",
+        &inject_rpus(&base, |_| Some(Rpu::Mel)),
+        &["ts"],
+    );
+
+    let reports = run_detector(&["--deep", media.to_str().unwrap()]);
+    assert_eq!(reports.len(), 6, "{reports:#?}");
+
+    let close = |file: &str, expected: f64| {
+        assert_eq!(status_of(&reports, file), "FEL", "{file}");
+        let measured = el_bitrate_of(&reports, file)
+            .unwrap_or_else(|| panic!("no EL bitrate for {file}: {reports:#?}"));
+        assert!(
+            (measured - expected).abs() / expected < 0.25,
+            "{file}: measured {measured} kb/s, expected about {expected} kb/s"
+        );
+    };
+    for file in ["single.hevc", "single.mkv", "single.ts"] {
+        close(file, expected_single);
+    }
+    close("dual.ts", expected_dual);
+
+    // No EL NAL units: no bitrate
+    assert_eq!(status_of(&reports, "mel.ts"), "MEL");
+    assert_eq!(el_bitrate_of(&reports, "mel.ts"), None);
+
+    let reports = run_detector(&["-F", "--deep", media.to_str().unwrap()]);
+    assert_eq!(reports.len(), 4, "{reports:#?}");
+    assert!(reports.iter().all(|r| r["status"] == "FEL"));
 }

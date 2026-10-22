@@ -49,9 +49,10 @@ struct Cli {
     #[arg(short, long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..))]
     frames: u32,
 
-    /// Keep sampling after FEL was found (more accurate statistics, slower)
+    /// Stop sampling a file once FEL was found (faster, but a less
+    /// accurate EL bitrate estimate)
     #[arg(long)]
-    full: bool,
+    fast: bool,
 
     /// Inspect RPUs of every HEVC file, even if the container signals no
     /// Dolby Vision enhancement layer
@@ -62,8 +63,8 @@ struct Cli {
     #[arg(short = 'o', long, value_enum, default_value_t = Format::Table)]
     format: Format,
 
-    /// Only report FEL files
-    #[arg(long)]
+    /// Only display files with a full enhancement layer
+    #[arg(short = 'F', long)]
     fel_only: bool,
 
     /// Path to the ffmpeg executable
@@ -164,17 +165,30 @@ fn print_table(reports: &[Report], all: &[Report], style: &Style) {
         .chain(["PROFILE".len()])
         .max()
         .unwrap_or(0);
+    let rate_w = reports
+        .iter()
+        .map(|r| r.el_bitrate_label().len())
+        .chain(["EL BITRATE".len()])
+        .max()
+        .unwrap_or(0);
     let status_w = 7;
 
-    println!("{:<status_w$}  {:<profile_w$}  PATH", "STATUS", "PROFILE");
+    println!(
+        "{:<status_w$}  {:<profile_w$}  {:>rate_w$}  PATH",
+        "STATUS", "PROFILE", "EL BITRATE"
+    );
     for r in reports {
         println!(
-            "{}  {:<profile_w$}  {}  ({})",
+            "{}  {:<profile_w$}  {:>rate_w$}  {}  ({})",
             style.status(r.status, status_w),
             r.profile_label(),
+            r.el_bitrate_label(),
             r.path.display(),
             r.detail
         );
+    }
+    if reports.is_empty() && !all.is_empty() {
+        println!("(no matching files)");
     }
 
     let count = |s: Status| all.iter().filter(|r| r.status == s).count();
@@ -200,16 +214,17 @@ fn csv_field(s: &str) -> String {
 }
 
 fn print_csv(reports: &[Report]) {
-    println!("path,status,profile,fel_rpus,mel_rpus,sampled_rpus,detail");
+    println!("path,status,profile,el_bitrate_kbps,fel_rpus,mel_rpus,sampled_rpus,detail");
     for r in reports {
         let stats = r.rpu_stats.as_ref();
         let num =
             |f: fn(&rpu::RpuStats) -> u64| stats.map(|s| f(s).to_string()).unwrap_or_default();
         println!(
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             csv_field(&r.path.to_string_lossy()),
             r.status.label(),
             r.profile_label(),
+            r.el_bitrate_kbps.map(|k| k.to_string()).unwrap_or_default(),
             num(|s| s.fel_rpus),
             num(|s| s.mel_rpus),
             num(|s| s.rpus),
@@ -247,7 +262,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         sample: SampleOptions {
             samples: cli.samples,
             frames: cli.frames,
-            full: cli.full,
+            fast: cli.fast,
         },
         deep: cli.deep,
     };
